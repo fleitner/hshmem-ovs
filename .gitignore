@@ -67,4 +67,6 @@ _debian
 odp-netlink.h
 OvsDpInterface.h
 /.vagrant/
-testsuite.tmp.orig
+/manpages.mk
+/_buildtestsuite.tmp.orig
+
