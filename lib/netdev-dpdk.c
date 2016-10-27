@@ -54,6 +54,7 @@
 #include "rte_config.h"
 #include "rte_mbuf.h"
 #include "rte_virtio_net.h"
+#include "rte_hshmem.h"
 
 VLOG_DEFINE_THIS_MODULE(dpdk);
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
@@ -139,6 +140,7 @@ enum { DRAIN_TSC = 200000ULL };
 enum dpdk_dev_type {
     DPDK_DEV_ETH = 0,
     DPDK_DEV_VHOST = 1,
+    DPDK_DEV_HSHMEM = 2,
 };
 
 static int rte_eal_init_ret = ENODEV;
@@ -208,6 +210,7 @@ struct netdev_dpdk {
     struct ovs_mutex mutex OVS_ACQ_AFTER(dpdk_mutex);
 
     struct dpdk_mp *dpdk_mp;
+    struct rte_hshmem *hshmem;
     int mtu;
     int socket_id;
     int buf_size;
@@ -612,18 +615,26 @@ netdev_dpdk_init(struct netdev *netdev_, unsigned int port_no,
     netdev->port_id = port_no;
     netdev->type = type;
     netdev->flags = 0;
-    netdev->mtu = ETHER_MTU;
-    netdev->max_packet_len = MTU_TO_MAX_LEN(netdev->mtu);
+    if (type == DPDK_DEV_HSHMEM) {
+        netdev->max_packet_len = HSHMEM_MAX_FRAME_LEN;
+        netdev->mtu = HSHMEM_MTU;
+        netdev_->n_txq = 1;
+        netdev_->n_rxq = 1;
+        netdev->real_n_txq = 1;
+    }
+    else {
+        netdev->max_packet_len = MTU_TO_MAX_LEN(netdev->mtu);
+        netdev->mtu = ETHER_MTU;
+        netdev_->n_txq = NR_QUEUE;
+        netdev_->n_rxq = NR_QUEUE;
+        netdev->real_n_txq = NR_QUEUE;
+    }
 
     netdev->dpdk_mp = dpdk_mp_get(netdev->socket_id, netdev->mtu);
     if (!netdev->dpdk_mp) {
         err = ENOMEM;
         goto unlock;
     }
-
-    netdev_->n_txq = NR_QUEUE;
-    netdev_->n_rxq = NR_QUEUE;
-    netdev->real_n_txq = NR_QUEUE;
 
     if (type == DPDK_DEV_ETH) {
         netdev_dpdk_alloc_txq(netdev, NR_QUEUE);
@@ -2121,6 +2132,191 @@ dpdk_common_init(void)
     ovs_thread_create("dpdk_watchdog", dpdk_watchdog, NULL);
 }
 
+/* Host shared Memory Rings */
+static int
+dpdk_hshmem_class_init(void)
+{
+    return 0;
+}
+
+static int
+hshmem_construct_helper(struct netdev *netdev_) OVS_REQUIRES(dpdk_mutex)
+{
+    if (rte_eal_init_ret) {
+        return rte_eal_init_ret;
+    }
+
+    return netdev_dpdk_init(netdev_, -1, DPDK_DEV_HSHMEM);
+}
+
+
+static int
+netdev_dpdk_hshmem_construct(struct netdev *netdev_)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);
+    const char *name = netdev_->name;
+    struct rte_hshmem *hshmem;
+    int err = 0;
+
+    /* 'name' is appended to 'vhost_sock_dir' and used to create a socket in
+     * the file system. '/' or '\' would traverse directories, so they're not
+     * acceptable in 'name'. */
+    if (strchr(name, '/') || strchr(name, '\\')) {
+        VLOG_ERR("\"%s\" is not a valid name for a vhost-user port. "
+                 "A valid name must not include '/' or '\\'",
+                 name);
+        return EINVAL;
+    }
+
+    ovs_mutex_lock(&dpdk_mutex);
+    /* Take the name of the vhost-user port and append it to the location where
+     * the socket is to be created, then register the socket.
+     */
+    snprintf(netdev->vhost_id, sizeof(netdev->vhost_id), "%s/%s",
+             "/dev/hugepages", name);
+
+    hshmem = rte_hshmem_open_shmem(netdev->vhost_id);
+    if (hshmem) {
+        VLOG_ERR("hshmem shmem device setup failure for file %s\n",
+                 netdev->vhost_id);
+        err = ENODEV;
+    } else {
+        VLOG_INFO("hshmem %s created for vhost-user port %s\n",
+                  netdev->vhost_id, name);
+        netdev->hshmem = hshmem;
+        err = hshmem_construct_helper(netdev_);
+    }
+
+    ovs_mutex_unlock(&dpdk_mutex);
+    return err;
+}
+
+static void
+netdev_dpdk_hshmem_destruct(struct netdev *netdev_)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev_);
+
+    ovs_mutex_lock(&dpdk_mutex);
+    rte_free(dev->tx_q);
+    list_remove(&dev->list_node);
+    dpdk_mp_put(dev->dpdk_mp);
+    rte_hshmem_close(dev->hshmem);
+    ovs_mutex_unlock(&dpdk_mutex);
+}
+
+static int
+netdev_dpdk_hshmem_set_multiq(struct netdev *netdev_, unsigned int n_txq,
+                             unsigned int n_rxq)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);
+    int err = 0;
+
+    if (netdev->up.n_txq == n_txq && netdev->up.n_rxq == n_rxq) {
+        return err;
+    }
+
+    ovs_mutex_lock(&dpdk_mutex);
+    ovs_mutex_lock(&netdev->mutex);
+
+    netdev->up.n_txq = n_txq;
+    netdev->real_n_txq = 1;
+    netdev->up.n_rxq = 1;
+    netdev->txq_needs_locking = netdev->real_n_txq != netdev->up.n_txq;
+
+    ovs_mutex_unlock(&netdev->mutex);
+    ovs_mutex_unlock(&dpdk_mutex);
+
+    return err;
+}
+
+static int
+netdev_dpdk_hshmem_send(struct netdev *netdev, int qid, struct dp_packet **pkts,
+                        int cnt, bool may_steal)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    unsigned int sent;
+    unsigned int i;
+
+    qid = dev->tx_q[qid % dev->real_n_txq].map;
+
+    /* FIXME: is it running? */
+    if (OVS_UNLIKELY(qid < 0 || !(dev->flags & NETDEV_UP))) {
+        rte_spinlock_lock(&dev->stats_lock);
+        dev->stats.tx_dropped+= cnt;
+        rte_spinlock_unlock(&dev->stats_lock);
+        goto out;
+    }
+
+    rte_spinlock_lock(&dev->tx_q[qid].tx_lock);
+    sent = rte_hshmem_tx(dev->hshmem, (struct rte_mbuf **)pkts, cnt);
+    rte_spinlock_unlock(&dev->tx_q[qid].tx_lock);
+
+    rte_spinlock_lock(&dev->stats_lock);
+    dev->stats.tx_packets += sent;
+    dev->stats.tx_dropped += cnt - sent;
+    for (i = 0; i < sent; i++) {
+        dev->stats.tx_bytes += dp_packet_size(pkts[i]);
+    }
+    rte_spinlock_unlock(&dev->stats_lock);
+
+out:
+    if (may_steal) {
+        int i;
+
+        for (i = 0; i < cnt; i++) {
+            dp_packet_delete(pkts[i]);
+        }
+    }
+
+    return 0;
+}
+
+static int
+netdev_dpdk_hshmem_get_carrier(OVS_UNUSED const struct netdev *netdev_,
+                               bool *carrier)
+{
+    /* FIXME: lazy dude... */
+    *carrier = 1;
+    return 0;
+}
+
+/*
+ * The receive path for the hshmem port is the TX path out from guest.
+ */
+static int
+netdev_dpdk_hshmem_rxq_recv(struct netdev_rxq *rxq_,
+                           struct dp_packet **packets, int *c)
+{
+    struct netdev_rxq_dpdk *rx = netdev_rxq_dpdk_cast(rxq_);
+    struct netdev *netdev = rx->up.netdev;
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    uint16_t nb_rx = 0;
+
+    /* FIXME: is it running? */
+    if (OVS_UNLIKELY(!(dev->flags & NETDEV_UP))) {
+        return EAGAIN;
+    }
+
+    if (rxq_->queue_id >= dev->real_n_rxq) {
+        return EOPNOTSUPP;
+    }
+
+    nb_rx = rte_hshmem_rx(dev->hshmem, (struct rte_mbuf **)packets,
+                          NETDEV_MAX_BURST);
+    if (!nb_rx) {
+        return EAGAIN;
+    }
+
+    rte_spinlock_lock(&dev->stats_lock);
+    netdev_dpdk_vhost_update_rx_counters(&dev->stats, packets, nb_rx);
+    rte_spinlock_unlock(&dev->stats_lock);
+
+    *c = (int) nb_rx;
+    return 0;
+}
+
+
+
 /* Client Rings */
 
 static int
@@ -2470,6 +2666,20 @@ static const struct netdev_class OVS_UNUSED dpdk_vhost_user_class =
         NULL,
         netdev_dpdk_vhost_rxq_recv);
 
+static const struct netdev_class dpdk_hshmem_class =
+    NETDEV_DPDK_CLASS(
+        "dpdkhshmem",
+        dpdk_hshmem_class_init,
+        netdev_dpdk_hshmem_construct,
+        netdev_dpdk_hshmem_destruct,
+        netdev_dpdk_hshmem_set_multiq,
+        netdev_dpdk_hshmem_send,
+        netdev_dpdk_hshmem_get_carrier,
+        netdev_dpdk_vhost_get_stats,
+        NULL,
+        NULL,
+        netdev_dpdk_hshmem_rxq_recv);
+
 void
 netdev_dpdk_register(void)
 {
@@ -2488,6 +2698,7 @@ netdev_dpdk_register(void)
 #else
         netdev_register_provider(&dpdk_vhost_user_class);
 #endif
+        netdev_register_provider(&dpdk_hshmem_class);
         ovsthread_once_done(&once);
     }
 }
