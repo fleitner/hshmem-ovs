@@ -2176,7 +2176,7 @@ netdev_dpdk_hshmem_construct(struct netdev *netdev_)
              "/dev/shm", name);
 
     hshmem = rte_hshmem_open_shmem(netdev->vhost_id);
-    if (hshmem) {
+    if (!hshmem) {
         VLOG_ERR("hshmem shmem device setup failure for file %s\n",
                  netdev->vhost_id);
         err = ENODEV;
