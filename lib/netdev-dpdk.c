@@ -2173,7 +2173,7 @@ netdev_dpdk_hshmem_construct(struct netdev *netdev_)
      * the socket is to be created, then register the socket.
      */
     snprintf(netdev->vhost_id, sizeof(netdev->vhost_id), "%s/%s",
-             "/dev/hugepages", name);
+             "/dev/shm", name);
 
     hshmem = rte_hshmem_open_shmem(netdev->vhost_id);
     if (hshmem) {
