@@ -2237,7 +2237,7 @@ netdev_dpdk_hshmem_send(struct netdev *netdev, int qid, struct dp_packet **pkts,
     unsigned int sent;
     unsigned int i;
 
-    qid = dev->tx_q[qid % dev->real_n_txq].map;
+    qid = qid % dev->real_n_txq;
 
     /* FIXME: is it running? */
     if (OVS_UNLIKELY(qid < 0 || !(dev->flags & NETDEV_UP))) {
