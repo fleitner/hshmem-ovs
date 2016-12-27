@@ -2297,7 +2297,7 @@ netdev_dpdk_hshmem_rxq_recv(struct netdev_rxq *rxq_,
         return EAGAIN;
     }
 
-    if (rxq_->queue_id >= dev->real_n_rxq) {
+    if (rxq_->queue_id > dev->real_n_rxq) {
         return EOPNOTSUPP;
     }
 
