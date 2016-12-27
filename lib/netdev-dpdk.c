@@ -2183,8 +2183,11 @@ netdev_dpdk_hshmem_construct(struct netdev *netdev_)
     } else {
         VLOG_INFO("hshmem %s created for vhost-user port %s\n",
                   netdev->vhost_id, name);
-        netdev->hshmem = hshmem;
         err = hshmem_construct_helper(netdev_);
+        if (!err) {
+            rte_hshmem_set_mempool(hshmem, netdev->dpdk_mp->mp);
+            netdev->hshmem = hshmem;
+        }
     }
 
     ovs_mutex_unlock(&dpdk_mutex);
