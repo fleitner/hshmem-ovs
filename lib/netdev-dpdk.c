@@ -616,15 +616,15 @@ netdev_dpdk_init(struct netdev *netdev_, unsigned int port_no,
     netdev->type = type;
     netdev->flags = 0;
     if (type == DPDK_DEV_HSHMEM) {
-        netdev->max_packet_len = HSHMEM_MAX_FRAME_LEN;
         netdev->mtu = HSHMEM_MTU;
+        netdev->max_packet_len = HSHMEM_MAX_FRAME_LEN;
         netdev_->n_txq = 1;
         netdev_->n_rxq = 1;
         netdev->real_n_txq = 1;
     }
     else {
-        netdev->max_packet_len = MTU_TO_MAX_LEN(netdev->mtu);
         netdev->mtu = ETHER_MTU;
+        netdev->max_packet_len = MTU_TO_MAX_LEN(netdev->mtu);
         netdev_->n_txq = NR_QUEUE;
         netdev_->n_rxq = NR_QUEUE;
         netdev->real_n_txq = NR_QUEUE;
